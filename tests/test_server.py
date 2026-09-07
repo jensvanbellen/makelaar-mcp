@@ -271,6 +271,8 @@ def test_get_price_history_returns_list():
 
     history = PriceHistory(
         status="ok",
+        report_url="https://walterliving.com/report/teststraat-1-amsterdam",
+        listing_count=2,
         changes=(
             PriceChange(
                 date="15 jan 2024",
@@ -299,6 +301,9 @@ def test_get_price_history_returns_list():
     assert result[0]["status"] == "asking_price"
     assert result[0]["price"] == 400_000
     assert result[0]["_entry_count"] == 2
+    # Walter-derived listing-level fields propagate to every entry.
+    assert result[0]["_listing_count"] == 2
+    assert result[0]["_report_url"].startswith("https://walterliving.com/report/")
 
 
 def test_get_price_history_empty():
