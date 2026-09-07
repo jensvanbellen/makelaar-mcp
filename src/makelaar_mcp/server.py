@@ -411,6 +411,10 @@ def get_price_history(listing_id: str | int) -> list[dict]:
     Date | Price | Status. Highlight price changes with ↓/↑ amounts.
     If 0 entries: "No price history available."
 
+    Each entry also carries `_listing_count` (how many times the property has
+    been listed on Funda — >1 means it was relisted, a useful negotiation signal)
+    and `_report_url` (the Walter Living valuation report for the address).
+
     When chaining with other tools, keep output BRIEF to avoid timeouts.
 
     Args:
@@ -420,12 +424,16 @@ def get_price_history(listing_id: str | int) -> list[dict]:
     try:
         listing = _client.listing(listing_id)
         history = _client.price_history(listing)
+        report_url = getattr(history, "report_url", None)
+        listing_count = getattr(history, "listing_count", None)
         changes = list(getattr(history, "changes", []) or [])
         if not changes:
             return [
                 {
                     "info": "No price history available for this listing.",
                     "entry_count": 0,
+                    "_listing_count": listing_count,
+                    "_report_url": report_url,
                 }
             ]
         entries = []
@@ -440,6 +448,8 @@ def get_price_history(listing_id: str | int) -> list[dict]:
                     "badge_text": change.badge_text,
                     "source": change.source,
                     "_entry_count": len(changes),
+                    "_listing_count": listing_count,
+                    "_report_url": report_url,
                 }
             )
         return entries
