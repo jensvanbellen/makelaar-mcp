@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.0,<2",
     "pyfunda>=3.1.5",
 ]
 
@@ -17,8 +17,8 @@ makelaar-mcp = "makelaar_mcp.server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
     "ruff>=0.15.5",
 ]

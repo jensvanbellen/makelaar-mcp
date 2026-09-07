@@ -1,8 +1,10 @@
 """Tests for makelaar_mcp.server."""
 
-import pytest
+import json
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from funda.listing import (
     Address,
     Areas,
@@ -18,6 +20,8 @@ from funda.listing import (
     Rooms,
     Urls,
 )
+
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def make_listing(
@@ -136,16 +140,38 @@ def test_search_listings_maps_filters_to_pyfunda():
     assert call.kwargs["page"] == 1
 
 
-def test_search_listings_photo_urls_empty_when_no_photos():
-    """search_listings returns empty photo_urls when listing has no photos."""
+def test_search_listings_omits_photo_keys_when_no_photos():
+    """search_listings drops photo keys (not empty lists) when there are no photos."""
     from makelaar_mcp.server import search_listings
 
     mock_listing = make_listing()  # no photos
     with patch("makelaar_mcp.server._client") as mock_client:
         mock_client.search.return_value = [mock_listing]
         result = search_listings(location="amsterdam")
-    assert result[0]["photo_urls"] == []
-    assert result[0]["first_photo_url"] is None
+    assert "photo_urls" not in result[0]
+    assert "first_photo_url" not in result[0]
+
+
+def test_search_listings_rent_omits_price_per_m2():
+    """search_listings suppresses price_per_m2 for rentals (meaningless monthly)."""
+    from makelaar_mcp.server import search_listings
+
+    mock_listing = make_listing(price=1_800, living_area=80)
+    with patch("makelaar_mcp.server._client") as mock_client:
+        mock_client.search.return_value = [mock_listing]
+        result = search_listings(location="amsterdam", offering_type="rent")
+    assert result[0]["price_per_m2"] is None
+    assert mock_client.search.call_args.kwargs["category"] == "rent"
+
+
+def test_search_listings_error_returns_error_type():
+    """search_listings error payload carries a coarse error_type."""
+    from makelaar_mcp.server import search_listings
+
+    with patch("makelaar_mcp.server._client") as mock_client:
+        mock_client.search.side_effect = ValueError("invalid sort value")
+        result = search_listings(location="amsterdam")
+    assert result[0]["error_type"] == "bad_input"
 
 
 def test_get_listing_includes_photo_urls():
@@ -693,3 +719,67 @@ def test_total_cost_error_handling():
 
     result = calculate_total_cost(purchase_price="not a number")  # type: ignore
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# error classification
+# ---------------------------------------------------------------------------
+
+
+def test_classify_error_types():
+    """_classify_error maps exceptions to coarse, model-actionable types."""
+    from makelaar_mcp import server
+    from funda import ListingNotFound, SearchError
+
+    assert server._classify_error(ListingNotFound("gone")) == "not_found"
+    assert server._classify_error(ValueError("bad")) == "bad_input"
+    assert server._classify_error(SearchError("upstream")) == "upstream"
+    assert (
+        server._classify_error(RuntimeError("curl: (92) HTTP/2 stream 1 reset"))
+        == "blocked"
+    )
+    assert (
+        server._classify_error(SearchError("Search failed (status 403)")) == "blocked"
+    )
+
+
+# ---------------------------------------------------------------------------
+# real-payload fixtures (network-free integration of the pyfunda 3.x parsers)
+# ---------------------------------------------------------------------------
+
+
+def test_detail_fixture_maps_through_helper():
+    """A recorded funda.io detail payload parses and maps to the detail dict."""
+    from funda.parsing import parse_listing
+    from makelaar_mcp.server import _detail_dict
+
+    raw = json.loads((_FIXTURES / "detail_43117443.json").read_text())
+    listing = parse_listing(raw)
+    result = _detail_dict(listing)
+
+    assert result["id"] == "43117443"
+    assert result["title"] == "Reehorst 13"
+    assert result["price"] == 695_000
+    assert result["living_area"] == 212
+    assert result["year_built"] == 1993
+    assert result["energy_label"] == "B"
+    assert result["price_per_m2"] == 695_000 // 212
+    assert len(result["photo_urls"]) > 0
+    assert result["photo_urls"][0].startswith("https://")
+
+
+def test_websearch_fixture_maps_through_helper():
+    """A recorded funda.nl web-search payload parses and maps to trimmed rows."""
+    from funda.parsing import parse_web_search_results
+    from makelaar_mcp.server import _trim_listing
+
+    raw = json.loads((_FIXTURES / "websearch_almere_listings.json").read_text())
+    listings = parse_web_search_results(raw, "buy")
+    assert listings
+    row = _trim_listing(listings[0])
+
+    assert row["id"]
+    assert isinstance(row["price"], int) and row["price"] > 0
+    assert row["living_area"] > 0
+    assert row["price_per_m2"] == row["price"] // row["living_area"]
+    assert row["url"].startswith("https://www.funda.nl/")

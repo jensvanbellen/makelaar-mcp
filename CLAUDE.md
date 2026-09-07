@@ -26,7 +26,7 @@ uv run python test_mcp_live.py --workers 10  # Live integration tests (sends pro
 - **Funda search fallback**: mobile search returns `401 no token provided`; pyfunda falls back to scraping funda.nl, which sits behind Akamai bot protection. `server.py` forces a working `curl_cffi` impersonation profile via `_client._web_session` and rotates through `_WEB_IMPERSONATE_POOL` on transport blocks. Refresh the pool if search starts failing.
 - **Dutch mortgage constants** (module-level `_UPPER_CASE`): NHG limits, tax rates, NIBUD multipliers — all 2025 values. Update these when regulations change.
 
-**Error handling pattern**: Every tool wraps its body in try/except and returns `{"error": str(exc)}` — tools never raise.
+**Error handling pattern**: Every tool wraps its body in try/except and returns a structured error via `_error(exc)` (`{"error": str(exc), "error_type": ...}`) — tools never raise. `error_type` is one of `not_found` / `blocked` / `bad_input` / `upstream` (see `_classify_error`), so the model can tell a bad ID from an IP block. Errors are logged to stderr (stdout is the MCP protocol channel).
 
 **Tool docstrings are functional**: They contain presentation instructions that guide Claude's response formatting. Changes to docstrings directly affect how Claude presents results.
 

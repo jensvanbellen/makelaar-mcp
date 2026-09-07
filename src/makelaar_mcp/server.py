@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+import time
+
 from mcp.server.fastmcp import FastMCP
-from funda import Funda, Listing
+from funda import (
+    Funda,
+    FundaError,
+    FundaRequestError,
+    FingerprintError,
+    Listing,
+    ListingNotFound,
+    PriceHistoryError,
+    SearchError,
+)
 
 try:
     from curl_cffi import requests as _curl_requests
@@ -12,13 +25,22 @@ except ImportError:  # pragma: no cover - curl_cffi ships with pyfunda
 
 mcp = FastMCP("makelaar")
 
+# Log to stderr — stdout carries the MCP protocol on the stdio transport.
+logger = logging.getLogger("makelaar_mcp")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(levelname)s makelaar_mcp: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
 # ---------------------------------------------------------------------------
 # Funda client + web-search fallback hardening
 # ---------------------------------------------------------------------------
 # Funda's mobile search API now returns "401 no token provided", so pyfunda
 # falls back to scraping the funda.nl web search page. That fallback hardcodes
 # a browser-impersonation profile that Akamai bot protection resets. We force a
-# profile that currently passes and rotate through a pool on transport failure.
+# profile that currently passes and rotate through a pool on transport failure,
+# remembering the last profile that worked so later searches start from it.
 _WEB_IMPERSONATE_POOL = (
     "chrome131",
     "chrome120",
@@ -30,6 +52,12 @@ _WEB_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "accept-language": "nl-NL,nl;q=0.9,en;q=0.8",
 }
+_ROTATE_BACKOFF = 0.5  # seconds, multiplied by attempt number between rotations
+_last_good_index = 0
+
+# Pace requests and let pyfunda's own transport retry/backoff kick in on the
+# detail API; a slower cadence lowers the risk of an IP-reputation block.
+_client = Funda(timeout=20, min_request_interval=1.0)
 
 
 def _make_web_session(impersonate: str):
@@ -38,9 +66,8 @@ def _make_web_session(impersonate: str):
     return session
 
 
-_client = Funda()
 if _curl_requests is not None:
-    _client._web_session = _make_web_session(_WEB_IMPERSONATE_POOL[0])
+    _client._web_session = _make_web_session(_WEB_IMPERSONATE_POOL[_last_good_index])
 
 
 def _is_transport_block(exc: Exception) -> bool:
@@ -55,23 +82,69 @@ def _is_transport_block(exc: Exception) -> bool:
             "blocked",
             "bot protection",
             "timed out",
+            "403",
+            "429",
+            "access denied",
         )
     )
 
 
+def _classify_error(exc: Exception) -> str:
+    """Map an exception to a coarse type the model can act on."""
+    if isinstance(exc, ListingNotFound):
+        return "not_found"
+    if _is_transport_block(exc):
+        return "blocked"
+    if isinstance(exc, (ValueError, TypeError)):
+        return "bad_input"
+    if isinstance(
+        exc,
+        (
+            SearchError,
+            PriceHistoryError,
+            FundaRequestError,
+            FingerprintError,
+            FundaError,
+        ),
+    ):
+        return "upstream"
+    return "upstream"
+
+
+def _error(exc: Exception, **extra) -> dict:
+    """Structured error payload: message + coarse type, logged to stderr."""
+    error_type = _classify_error(exc)
+    logger.warning("%s: %s", error_type, exc)
+    return {"error": str(exc), "error_type": error_type, **extra}
+
+
 def _search(location, **kwargs) -> list[Listing]:
-    """Call Funda search, rotating the web-fallback impersonation on transport blocks."""
+    """Call Funda search, rotating the web-fallback impersonation on transport blocks.
+
+    Starts from the last profile that worked, backs off between rotations, and
+    caches the winning profile so subsequent searches skip the dead ones.
+    """
+    global _last_good_index
     if _curl_requests is None:
         return _client.search(location, **kwargs)
+    pool_size = len(_WEB_IMPERSONATE_POOL)
+    order = [(_last_good_index + i) % pool_size for i in range(pool_size)]
     last_exc: Exception | None = None
-    for impersonate in _WEB_IMPERSONATE_POOL:
+    for attempt, idx in enumerate(order):
+        if attempt > 0:
+            time.sleep(_ROTATE_BACKOFF * attempt)
+        _client._web_session = _make_web_session(_WEB_IMPERSONATE_POOL[idx])
         try:
-            return _client.search(location, **kwargs)
+            results = _client.search(location, **kwargs)
+            _last_good_index = idx
+            return results
         except Exception as exc:  # noqa: BLE001
             if not _is_transport_block(exc):
                 raise
             last_exc = exc
-            _client._web_session = _make_web_session(impersonate)
+            logger.info(
+                "search profile %s blocked, rotating", _WEB_IMPERSONATE_POOL[idx]
+            )
     raise last_exc if last_exc else RuntimeError("Search failed")
 
 
@@ -88,25 +161,30 @@ def _price_per_m2(price: int | None, area: int | None) -> int | None:
     return (price // area) if (price and area) else None
 
 
-def _trim_listing(listing: Listing) -> dict:
+def _trim_listing(listing: Listing, offering_type: str = "buy") -> dict:
     """Return a trimmed dict of key fields from a Listing object (search results)."""
     price = listing.price.amount or 0
     area = listing.living_area or 0
     photo_urls = _photo_urls(listing)
-    return {
+    row = {
         "id": listing.id,
         "title": listing.title,
         "city": listing.city,
         "price": price,
         "living_area": area,
-        "price_per_m2": _price_per_m2(price, area),
+        # price/m² is meaningless for monthly rent, so omit it there.
+        "price_per_m2": None if offering_type == "rent" else _price_per_m2(price, area),
         "bedrooms": listing.bedrooms,
         "energy_label": listing.energy_label,
         "url": listing.url,
         "publication_date": listing.publication_date,
-        "first_photo_url": photo_urls[0] if photo_urls else None,
-        "photo_urls": photo_urls,
     }
+    # Funda's web search omits photo URLs; only include the keys when populated
+    # so an empty list doesn't read as a failure.
+    if photo_urls:
+        row["first_photo_url"] = photo_urls[0]
+        row["photo_urls"] = photo_urls
+    return row
 
 
 def _compare_row(listing: Listing) -> dict:
@@ -200,7 +278,7 @@ def search_listings(
 
     Args:
         location: City/neighbourhood/postcode — always lowercase.
-        offering_type: "buy" (default) or "rent".
+        offering_type: "buy" (default), "rent", or "sold" (recently sold, for comps).
         price_min: Minimum asking price in €.
         price_max: Maximum asking price in €.
         area_min: Minimum living area in m².
@@ -249,7 +327,7 @@ def search_listings(
 
         results = _search(location, **filters)
         PAGE_SIZE = 15
-        listings = [_trim_listing(r) for r in results]
+        listings = [_trim_listing(r, offering_type) for r in results]
         # Build search metadata so Claude can report exact parameters used
         search_meta = {
             "_search_location": location,
@@ -292,7 +370,7 @@ def search_listings(
             ]
         return listings
     except Exception as exc:  # noqa: BLE001
-        return [{"error": str(exc)}]
+        return [_error(exc)]
 
 
 @mcp.tool()
@@ -320,7 +398,7 @@ def get_listing(listing_id: str | int) -> dict:
         data["_requested_id"] = str(listing_id)
         return data
     except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc), "_requested_id": str(listing_id)}
+        return _error(exc, _requested_id=str(listing_id))
 
 
 @mcp.tool()
@@ -366,7 +444,7 @@ def get_price_history(listing_id: str | int) -> list[dict]:
             )
         return entries
     except Exception as exc:  # noqa: BLE001
-        return [{"error": str(exc)}]
+        return [_error(exc)]
 
 
 @mcp.tool()
@@ -388,7 +466,7 @@ def compare_listings(listing_ids: list[str | int]) -> list[dict]:
             listing = _client.listing(lid)
             rows.append(_compare_row(listing))
         except Exception as exc:  # noqa: BLE001
-            rows.append({"error": str(exc), "requested_id": lid})
+            rows.append(_error(exc, requested_id=lid))
     return rows
 
 
@@ -591,7 +669,7 @@ def calculate_dutch_mortgage(
 
         return result
     except Exception as exc:
-        return {"error": str(exc)}
+        return _error(exc)
 
 
 @mcp.tool()
@@ -729,7 +807,7 @@ def calculate_total_cost(
             "disclaimer": "Approximation for informational purposes only — not financial advice. Consult a licensed hypotheekadviseur.",
         }
     except Exception as exc:
-        return {"error": str(exc)}
+        return _error(exc)
 
 
 def main() -> None:
