@@ -20,8 +20,10 @@ uv run python test_mcp_live.py --workers 10  # Live integration tests (sends pro
 
 **Single server file** (`src/makelaar_mcp/server.py`): All tools live here. No submodules.
 
-- **Helpers** (`_trim_listing`, `_compare_row`, `_photo_id_to_url`): Transform pyfunda Listing objects into trimmed JSON-serializable dicts.
+- **Helpers** (`_trim_listing`, `_compare_row`, `_detail_dict`, `_photo_urls`): Transform pyfunda 3.x `Listing` objects (attribute access, e.g. `listing.price.amount`, `listing.living_area`, `listing.media.photos`) into trimmed JSON-serializable dicts.
 - **6 MCP tools**: `search_listings`, `get_listing`, `get_price_history`, `compare_listings`, `calculate_dutch_mortgage`, `calculate_total_cost`.
+- **Client methods (pyfunda 3.x)**: `_client.search(location, category=..., **filters)`, `_client.listing(id)`, `_client.price_history(listing)`. Search maps MCP args to pyfunda filter names (`offering_type`→`category`, `price_min`→`min_price`, etc.).
+- **Funda search fallback**: mobile search returns `401 no token provided`; pyfunda falls back to scraping funda.nl, which sits behind Akamai bot protection. `server.py` forces a working `curl_cffi` impersonation profile via `_client._web_session` and rotates through `_WEB_IMPERSONATE_POOL` on transport blocks. Refresh the pool if search starts failing.
 - **Dutch mortgage constants** (module-level `_UPPER_CASE`): NHG limits, tax rates, NIBUD multipliers — all 2025 values. Update these when regulations change.
 
 **Error handling pattern**: Every tool wraps its body in try/except and returns `{"error": str(exc)}` — tools never raise.

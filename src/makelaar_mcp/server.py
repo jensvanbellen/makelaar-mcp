@@ -3,10 +3,63 @@
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
-from funda import Funda
+from funda import Funda, Listing
+
+try:
+    from curl_cffi import requests as _curl_requests
+except ImportError:  # pragma: no cover - curl_cffi ships with pyfunda
+    _curl_requests = None
 
 mcp = FastMCP("makelaar")
+
+# ---------------------------------------------------------------------------
+# Funda client + web-search fallback hardening
+# ---------------------------------------------------------------------------
+# Funda's mobile search API now returns "401 no token provided", so pyfunda
+# falls back to scraping the funda.nl web search page. That fallback hardcodes
+# a browser-impersonation profile that Akamai bot protection resets. We force a
+# profile that currently passes and rotate through a pool on transport failure.
+_WEB_IMPERSONATE_POOL = ("chrome131", "chrome120", "safari17_0", "firefox133", "chrome110")
+_WEB_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "nl-NL,nl;q=0.9,en;q=0.8",
+}
+
+
+def _make_web_session(impersonate: str):
+    session = _curl_requests.Session(impersonate=impersonate)
+    session.headers.update(_WEB_HEADERS)
+    return session
+
+
 _client = Funda()
+if _curl_requests is not None:
+    _client._web_session = _make_web_session(_WEB_IMPERSONATE_POOL[0])
+
+
+def _is_transport_block(exc: Exception) -> bool:
+    """True when the error looks like bot-protection / TLS reset, not a bad query."""
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in ("reset", "http/2", "curl:", "blocked", "bot protection", "timed out")
+    )
+
+
+def _search(location, **kwargs) -> list[Listing]:
+    """Call Funda search, rotating the web-fallback impersonation on transport blocks."""
+    if _curl_requests is None:
+        return _client.search(location, **kwargs)
+    last_exc: Exception | None = None
+    for impersonate in _WEB_IMPERSONATE_POOL:
+        try:
+            return _client.search(location, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_transport_block(exc):
+                raise
+            last_exc = exc
+            _client._web_session = _make_web_session(impersonate)
+    raise last_exc if last_exc else RuntimeError("Search failed")
 
 
 # ---------------------------------------------------------------------------
@@ -14,67 +67,85 @@ _client = Funda()
 # ---------------------------------------------------------------------------
 
 
-def _photo_id_to_url(photo_id: int) -> str:
-    """Convert a funda photo integer ID to a full CDN URL.
-
-    e.g. 225504764 → https://cloud.funda.nl/valentina_media/225/504/764.jpg
-    """
-    s = str(photo_id).zfill(9)
-    return f"https://cloud.funda.nl/valentina_media/{s[0:3]}/{s[3:6]}/{s[6:9]}.jpg"
+def _photo_urls(listing: Listing) -> list[str]:
+    return [item.url for item in listing.media.photos if item.url]
 
 
-def _trim_listing(listing) -> dict:
-    """Return a trimmed dict of key fields from a Listing object.
+def _price_per_m2(price: int | None, area: int | None) -> int | None:
+    return (price // area) if (price and area) else None
 
-    Handles both search-result field names (global_id, detail_url, publish_date)
-    and full-detail field names (tiny_id, url, publication_date).
-    """
-    price = listing.get("price") or 0
-    area = listing.get("living_area") or 0
-    price_per_m2 = (price // area) if area else None
-    raw_photos = listing.get("photos") or []
-    photo_urls = listing.get("photo_urls") or [
-        _photo_id_to_url(p) for p in raw_photos if isinstance(p, int)
-    ]
-    first_photo_url = photo_urls[0] if photo_urls else None
-    detail_url = listing.get("url") or listing.get("detail_url") or ""
-    if detail_url and not detail_url.startswith("http"):
-        detail_url = "https://www.funda.nl" + detail_url
+
+def _trim_listing(listing: Listing) -> dict:
+    """Return a trimmed dict of key fields from a Listing object (search results)."""
+    price = listing.price.amount or 0
+    area = listing.living_area or 0
+    photo_urls = _photo_urls(listing)
     return {
-        "id": listing.get("tiny_id") or listing.get("global_id"),
-        "title": listing.get("title"),
-        "city": listing.get("city"),
+        "id": listing.id,
+        "title": listing.title,
+        "city": listing.city,
         "price": price,
         "living_area": area,
-        "price_per_m2": price_per_m2,
-        "bedrooms": listing.get("bedrooms"),
-        "energy_label": listing.get("energy_label"),
-        "url": detail_url,
-        "publication_date": listing.get("publication_date")
-        or listing.get("publish_date"),
-        "first_photo_url": first_photo_url,
+        "price_per_m2": _price_per_m2(price, area),
+        "bedrooms": listing.bedrooms,
+        "energy_label": listing.energy_label,
+        "url": listing.url,
+        "publication_date": listing.publication_date,
+        "first_photo_url": photo_urls[0] if photo_urls else None,
         "photo_urls": photo_urls,
     }
 
 
-def _compare_row(listing) -> dict:
+def _compare_row(listing: Listing) -> dict:
     """Return a comparison-focused dict from a Listing object."""
-    price = listing.get("price") or 0
-    area = listing.get("living_area") or 0
-    price_per_m2 = (price // area) if area else None
+    price = listing.price.amount or 0
+    area = listing.living_area or 0
     return {
-        "tiny_id": listing.get("tiny_id"),
-        "title": listing.get("title"),
-        "city": listing.get("city"),
+        "tiny_id": listing.tiny_id or listing.id,
+        "title": listing.title,
+        "city": listing.city,
         "price": price,
         "living_area": area,
-        "price_per_m2": price_per_m2,
-        "bedrooms": listing.get("bedrooms"),
-        "bathrooms": listing.get("bathrooms"),
-        "year_built": listing.get("year_built"),
-        "energy_label": listing.get("energy_label"),
-        "garden": listing.get("garden"),
-        "url": listing.get("url"),
+        "price_per_m2": _price_per_m2(price, area),
+        "bedrooms": listing.bedrooms,
+        "bathrooms": listing.characteristic("Aantal badkamers"),
+        "year_built": listing.property_details.construction_year,
+        "energy_label": listing.energy_label,
+        "garden": listing.characteristic("Tuin"),
+        "url": listing.url,
+    }
+
+
+def _detail_dict(listing: Listing) -> dict:
+    """Curated flat dict of a full listing detail (kept lean to avoid timeouts)."""
+    price = listing.price.amount or 0
+    area = listing.living_area or 0
+    photo_urls = _photo_urls(listing)
+    return {
+        "id": listing.id,
+        "tiny_id": listing.tiny_id,
+        "global_id": listing.global_id,
+        "title": listing.title,
+        "city": listing.city,
+        "postcode": listing.postcode,
+        "price": price,
+        "price_formatted": listing.price.formatted,
+        "living_area": area,
+        "plot_area": listing.plot_area,
+        "price_per_m2": _price_per_m2(price, area),
+        "rooms": listing.rooms_count,
+        "bedrooms": listing.bedrooms,
+        "bathrooms": listing.characteristic("Aantal badkamers"),
+        "year_built": listing.property_details.construction_year,
+        "object_type": listing.property_details.object_type,
+        "energy_label": listing.energy_label,
+        "status": listing.status,
+        "garden": listing.characteristic("Tuin"),
+        "url": listing.url,
+        "publication_date": listing.publication_date,
+        "description": listing.description,
+        "first_photo_url": photo_urls[0] if photo_urls else None,
+        "photo_urls": photo_urls,
     }
 
 
@@ -124,7 +195,7 @@ def search_listings(
         object_type: Property types, e.g. ["house", "apartment"].
         energy_label: Energy labels, e.g. ["A", "A+", "A++"].
         radius_km: Search radius in km.
-        sort: "newest" | "price_asc" | "price_desc" | "area_asc" | "area_desc" | "oldest".
+        sort: "newest" | "oldest" | "price_asc" | "price_desc" | "area_desc".
         page: 0-indexed page number.
     """
     try:
@@ -145,19 +216,25 @@ def search_listings(
             location = location.lower()
         else:
             location = [loc.lower() for loc in location]
-        results = _client.search_listing(
-            location=location,
-            offering_type=offering_type,
-            price_min=price_min,
-            price_max=price_max,
-            area_min=area_min,
-            area_max=area_max,
-            object_type=object_type,
-            energy_label=energy_label,
-            radius_km=radius_km,
-            sort=sort,
-            page=page,
-        )
+
+        # Map MCP args to pyfunda 3.x filter names (only pass non-defaults).
+        filters: dict = {"category": offering_type, "sort": sort, "page": page}
+        if price_min is not None:
+            filters["min_price"] = price_min
+        if price_max is not None:
+            filters["max_price"] = price_max
+        if area_min is not None:
+            filters["min_area"] = area_min
+        if area_max is not None:
+            filters["max_area"] = area_max
+        if object_type is not None:
+            filters["object_type"] = object_type
+        if energy_label is not None:
+            filters["energy_label"] = energy_label
+        if radius_km is not None:
+            filters["radius_km"] = radius_km
+
+        results = _search(location, **filters)
         PAGE_SIZE = 15
         listings = [_trim_listing(r) for r in results]
         # Build search metadata so Claude can report exact parameters used
@@ -225,20 +302,9 @@ def get_listing(listing_id: str | int) -> dict:
                     the full funda.nl URL (e.g. https://www.funda.nl/detail/...).
     """
     try:
-        listing = _client.get_listing(listing_id)
-        data = listing.to_dict()
-        # Add requested_id for traceability and normalize key fields
+        listing = _client.listing(listing_id)
+        data = _detail_dict(listing)
         data["_requested_id"] = str(listing_id)
-        # Ensure consistent field names with search results
-        if "tiny_id" in data and "id" not in data:
-            data["id"] = data["tiny_id"]
-        elif "global_id" in data and "id" not in data:
-            data["id"] = data["global_id"]
-        # Ensure price_per_m2 is present
-        price = data.get("price") or 0
-        area = data.get("living_area") or 0
-        if "price_per_m2" not in data:
-            data["price_per_m2"] = (price // area) if area else None
         return data
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "_requested_id": str(listing_id)}
@@ -261,19 +327,31 @@ def get_price_history(listing_id: str | int) -> list[dict]:
                     the full funda.nl URL.
     """
     try:
-        listing = _client.get_listing(listing_id)
-        history = _client.get_price_history(listing)
-        if not history:
+        listing = _client.listing(listing_id)
+        history = _client.price_history(listing)
+        changes = list(getattr(history, "changes", []) or [])
+        if not changes:
             return [
                 {
                     "info": "No price history available for this listing.",
                     "entry_count": 0,
                 }
             ]
-        # Add entry_count metadata so Claude can report the exact number
-        for entry in history:
-            entry["_entry_count"] = len(history)
-        return history
+        entries = []
+        for change in changes:
+            entries.append(
+                {
+                    "date": change.date,
+                    "timestamp": change.timestamp,
+                    "price": change.price,
+                    "human_price": change.human_price,
+                    "status": change.status,
+                    "badge_text": change.badge_text,
+                    "source": change.source,
+                    "_entry_count": len(changes),
+                }
+            )
+        return entries
     except Exception as exc:  # noqa: BLE001
         return [{"error": str(exc)}]
 
@@ -294,7 +372,7 @@ def compare_listings(listing_ids: list[str | int]) -> list[dict]:
     rows = []
     for lid in listing_ids:
         try:
-            listing = _client.get_listing(lid)
+            listing = _client.listing(lid)
             rows.append(_compare_row(listing))
         except Exception as exc:  # noqa: BLE001
             rows.append({"error": str(exc), "requested_id": lid})
