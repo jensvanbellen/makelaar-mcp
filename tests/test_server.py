@@ -51,9 +51,7 @@ def make_listing(
     sections = (
         (CharacteristicSection(title="Indeling", items=tuple(chars)),) if chars else ()
     )
-    photos = tuple(
-        MediaItem(id=str(i), url=u) for i, u in enumerate(photo_urls or [])
-    )
+    photos = tuple(MediaItem(id=str(i), url=u) for i, u in enumerate(photo_urls or []))
     return Listing(
         tiny_id=tiny_id,
         global_id=global_id,

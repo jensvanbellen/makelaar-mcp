@@ -19,7 +19,13 @@ mcp = FastMCP("makelaar")
 # falls back to scraping the funda.nl web search page. That fallback hardcodes
 # a browser-impersonation profile that Akamai bot protection resets. We force a
 # profile that currently passes and rotate through a pool on transport failure.
-_WEB_IMPERSONATE_POOL = ("chrome131", "chrome120", "safari17_0", "firefox133", "chrome110")
+_WEB_IMPERSONATE_POOL = (
+    "chrome131",
+    "chrome120",
+    "safari17_0",
+    "firefox133",
+    "chrome110",
+)
 _WEB_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "accept-language": "nl-NL,nl;q=0.9,en;q=0.8",
@@ -42,7 +48,14 @@ def _is_transport_block(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(
         token in msg
-        for token in ("reset", "http/2", "curl:", "blocked", "bot protection", "timed out")
+        for token in (
+            "reset",
+            "http/2",
+            "curl:",
+            "blocked",
+            "bot protection",
+            "timed out",
+        )
     )
 
 
