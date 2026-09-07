@@ -1,29 +1,80 @@
-"""Tests for makelaar_mcp.server — written BEFORE implementation (TDD)."""
+"""Tests for makelaar_mcp.server."""
+
+import json
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
-from unittest.mock import patch
-from funda.listing import Listing
+from funda.listing import (
+    Address,
+    Areas,
+    Characteristic,
+    CharacteristicSection,
+    Listing,
+    Media,
+    MediaItem,
+    PriceChange,
+    PriceHistory,
+    PropertyDetails,
+    Price,
+    Rooms,
+    Urls,
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def make_listing(**kwargs):
-    """Helper: create a Listing with sensible defaults."""
-    defaults = {
-        "tiny_id": "12345678",
-        "title": "Teststraat 1",
-        "city": "Amsterdam",
-        "price": 400_000,
-        "living_area": 80,
-        "bedrooms": 3,
-        "bathrooms": 1,
-        "year_built": 2000,
-        "energy_label": "A",
-        "url": "https://www.funda.nl/detail/koop/amsterdam/huis-12345678/",
-        "publication_date": "2024-01-15",
-        "coordinates": [52.37, 4.89],
-        "garden": True,
-    }
-    defaults.update(kwargs)
-    return Listing(data=defaults)
+def make_listing(
+    *,
+    tiny_id="12345678",
+    global_id=None,
+    title="Teststraat 1",
+    city="Amsterdam",
+    price=400_000,
+    living_area=80,
+    plot_area=None,
+    rooms=None,
+    bedrooms=3,
+    bathrooms="1 badkamer",
+    year_built=2000,
+    object_type="house",
+    status="available",
+    energy_label="A",
+    url="https://www.funda.nl/detail/koop/amsterdam/huis-12345678/",
+    publication_date="2024-01-15",
+    garden="Achtertuin",
+    description=None,
+    photo_urls=None,
+):
+    """Build a pyfunda 3.x Listing with sensible defaults for tests."""
+    chars = []
+    if bathrooms is not None:
+        chars.append(Characteristic(label="Aantal badkamers", value=bathrooms))
+    if garden is not None:
+        chars.append(Characteristic(label="Tuin", value=garden))
+    sections = (
+        (CharacteristicSection(title="Indeling", items=tuple(chars)),) if chars else ()
+    )
+    photos = tuple(MediaItem(id=str(i), url=u) for i, u in enumerate(photo_urls or []))
+    return Listing(
+        tiny_id=tiny_id,
+        global_id=global_id,
+        address=Address(title=title, city=city),
+        price=Price(amount=price, formatted=f"€ {price:,}".replace(",", ".")),
+        areas=Areas(living=living_area, plot=plot_area),
+        rooms=Rooms(total=rooms, bedrooms=bedrooms),
+        property_details=PropertyDetails(
+            object_type=object_type,
+            construction_year=year_built,
+            energy_label=energy_label,
+            status=status,
+        ),
+        urls=Urls(full=url),
+        media=Media(photos=photos),
+        characteristics=sections,
+        publication_date=publication_date,
+        description=description,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +86,13 @@ def test_search_listings_returns_list():
     """search_listings returns a list of dicts with expected keys including photo_urls."""
     from makelaar_mcp.server import search_listings
 
-    mock_listing = make_listing(photos=[225504764, 225504714])
+    photos = [
+        "https://cloud.funda.nl/valentina_media/225/504/764.jpg",
+        "https://cloud.funda.nl/valentina_media/225/504/714.jpg",
+    ]
+    mock_listing = make_listing(photo_urls=photos)
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.return_value = [mock_listing]
+        mock_client.search.return_value = [mock_listing]
         result = search_listings(location="amsterdam", price_max=500_000)
 
     assert isinstance(result, list)
@@ -57,65 +112,78 @@ def test_search_listings_returns_list():
     ):
         assert key in row, f"Missing key: {key}"
     assert row["price_per_m2"] == 400_000 // 80
-    assert row["photo_urls"] == [
-        "https://cloud.funda.nl/valentina_media/225/504/764.jpg",
-        "https://cloud.funda.nl/valentina_media/225/504/714.jpg",
-    ]
+    assert row["photo_urls"] == photos
+    assert row["first_photo_url"] == photos[0]
 
 
-def test_search_listings_uses_search_result_field_names():
-    """search_listings handles search-result field names: global_id, detail_url, publish_date."""
+def test_search_listings_maps_filters_to_pyfunda():
+    """search_listings maps MCP args to pyfunda 3.x filter names."""
     from makelaar_mcp.server import search_listings
 
-    mock_listing = make_listing(
-        tiny_id=None,
-        global_id=43362740,
-        url=None,
-        detail_url="/detail/koop/amsterdam/huis-teststraat-1/43362740/",
-        publication_date=None,
-        publish_date="2024-01-15T10:00:00+01:00",
-    )
+    mock_listing = make_listing()
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.return_value = [mock_listing]
-        result = search_listings(location="amsterdam")
+        mock_client.search.return_value = [mock_listing]
+        search_listings(
+            location="amsterdam",
+            offering_type="buy",
+            price_min=200_000,
+            price_max=500_000,
+            area_min=60,
+            page=1,
+        )
+        call = mock_client.search.call_args
+    assert call.args[0] == "amsterdam"
+    assert call.kwargs["category"] == "buy"
+    assert call.kwargs["min_price"] == 200_000
+    assert call.kwargs["max_price"] == 500_000
+    assert call.kwargs["min_area"] == 60
+    assert call.kwargs["page"] == 1
 
-    row = result[0]
-    assert row["id"] == 43362740
-    assert (
-        row["url"]
-        == "https://www.funda.nl/detail/koop/amsterdam/huis-teststraat-1/43362740/"
-    )
-    assert row["publication_date"] == "2024-01-15T10:00:00+01:00"
 
-
-def test_search_listings_photo_urls_empty_when_no_photos():
-    """search_listings returns empty photo_urls when listing has no photos."""
+def test_search_listings_omits_photo_keys_when_no_photos():
+    """search_listings drops photo keys (not empty lists) when there are no photos."""
     from makelaar_mcp.server import search_listings
 
-    mock_listing = make_listing()  # no photos key
+    mock_listing = make_listing()  # no photos
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.return_value = [mock_listing]
+        mock_client.search.return_value = [mock_listing]
         result = search_listings(location="amsterdam")
+    assert "photo_urls" not in result[0]
+    assert "first_photo_url" not in result[0]
 
-    assert result[0]["photo_urls"] == []
+
+def test_search_listings_rent_omits_price_per_m2():
+    """search_listings suppresses price_per_m2 for rentals (meaningless monthly)."""
+    from makelaar_mcp.server import search_listings
+
+    mock_listing = make_listing(price=1_800, living_area=80)
+    with patch("makelaar_mcp.server._client") as mock_client:
+        mock_client.search.return_value = [mock_listing]
+        result = search_listings(location="amsterdam", offering_type="rent")
+    assert result[0]["price_per_m2"] is None
+    assert mock_client.search.call_args.kwargs["category"] == "rent"
+
+
+def test_search_listings_error_returns_error_type():
+    """search_listings error payload carries a coarse error_type."""
+    from makelaar_mcp.server import search_listings
+
+    with patch("makelaar_mcp.server._client") as mock_client:
+        mock_client.search.side_effect = ValueError("invalid sort value")
+        result = search_listings(location="amsterdam")
+    assert result[0]["error_type"] == "bad_input"
 
 
 def test_get_listing_includes_photo_urls():
     """get_listing result includes photo_urls from the full listing detail."""
     from makelaar_mcp.server import get_listing
 
-    mock_listing = make_listing(
-        photo_urls=[
-            "https://cloud.funda.nl/valentina_media/225/504/764.jpg",
-            "https://cloud.funda.nl/valentina_media/225/504/714.jpg",
-        ]
-    )
+    photos = ["https://cloud.funda.nl/valentina_media/225/504/764.jpg"]
+    mock_listing = make_listing(photo_urls=photos)
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.return_value = mock_listing
+        mock_client.listing.return_value = mock_listing
         result = get_listing(listing_id=12345678)
-
-    assert "photo_urls" in result
-    assert result["photo_urls"][0].startswith("https://cloud.funda.nl")
+    assert result["photo_urls"] == photos
 
 
 def test_search_listings_lowercases_location():
@@ -124,28 +192,25 @@ def test_search_listings_lowercases_location():
 
     mock_listing = make_listing()
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.return_value = [mock_listing]
+        mock_client.search.return_value = [mock_listing]
         search_listings(location="Amsterdam")
-        call_kwargs = mock_client.search_listing.call_args.kwargs
-        assert call_kwargs["location"] == "amsterdam"
+        assert mock_client.search.call_args.args[0] == "amsterdam"
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.return_value = [mock_listing]
+        mock_client.search.return_value = [mock_listing]
         search_listings(location=["Amsterdam", "Rotterdam"])
-        call_kwargs = mock_client.search_listing.call_args.kwargs
-        assert call_kwargs["location"] == ["amsterdam", "rotterdam"]
+        assert mock_client.search.call_args.args[0] == ["amsterdam", "rotterdam"]
 
 
 def test_search_listings_error_handling():
-    """search_listings returns error dict when the API raises."""
+    """search_listings returns error dict when the API raises a non-transport error."""
     from makelaar_mcp.server import search_listings
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.search_listing.side_effect = RuntimeError("network error")
+        mock_client.search.side_effect = ValueError("invalid sort value")
         result = search_listings(location="amsterdam")
 
     assert isinstance(result, list)
-    assert len(result) == 1
     assert "error" in result[0]
 
 
@@ -160,12 +225,14 @@ def test_get_listing_by_id():
 
     mock_listing = make_listing()
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.return_value = mock_listing
+        mock_client.listing.return_value = mock_listing
         result = get_listing(listing_id=12345678)
 
     assert isinstance(result, dict)
     assert result["title"] == "Teststraat 1"
-    mock_client.get_listing.assert_called_once_with(12345678)
+    assert result["price"] == 400_000
+    assert result["year_built"] == 2000
+    mock_client.listing.assert_called_once_with(12345678)
 
 
 def test_get_listing_by_url():
@@ -175,11 +242,11 @@ def test_get_listing_by_url():
     url = "https://www.funda.nl/detail/koop/amsterdam/huis-12345678/"
     mock_listing = make_listing()
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.return_value = mock_listing
+        mock_client.listing.return_value = mock_listing
         result = get_listing(listing_id=url)
 
     assert isinstance(result, dict)
-    mock_client.get_listing.assert_called_once_with(url)
+    mock_client.listing.assert_called_once_with(url)
 
 
 def test_get_listing_error_handling():
@@ -187,7 +254,7 @@ def test_get_listing_error_handling():
     from makelaar_mcp.server import get_listing
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.side_effect = ValueError("not found")
+        mock_client.listing.side_effect = ValueError("not found")
         result = get_listing(listing_id=99999999)
 
     assert "error" in result
@@ -202,31 +269,49 @@ def test_get_price_history_returns_list():
     """get_price_history returns a list of price-history dicts."""
     from makelaar_mcp.server import get_price_history
 
-    fake_history = [
-        {
-            "date": "15 jan, 2024",
-            "price": 400_000,
-            "human_price": "€400.000",
-            "status": "asking_price",
-            "source": "Funda",
-        },
-        {
-            "date": "1 mrt, 2023",
-            "price": 380_000,
-            "human_price": "€380.000",
-            "status": "asking_price",
-            "source": "Funda",
-        },
-    ]
+    history = PriceHistory(
+        status="ok",
+        changes=(
+            PriceChange(
+                date="15 jan 2024",
+                price=400_000,
+                human_price="€ 400.000",
+                status="asking_price",
+                source="Funda",
+            ),
+            PriceChange(
+                date="1 mrt 2023",
+                price=380_000,
+                human_price="€ 380.000",
+                status="asking_price",
+                source="Funda",
+            ),
+        ),
+    )
     mock_listing = make_listing()
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.return_value = mock_listing
-        mock_client.get_price_history.return_value = fake_history
+        mock_client.listing.return_value = mock_listing
+        mock_client.price_history.return_value = history
         result = get_price_history(listing_id=12345678)
 
     assert isinstance(result, list)
     assert len(result) == 2
     assert result[0]["status"] == "asking_price"
+    assert result[0]["price"] == 400_000
+    assert result[0]["_entry_count"] == 2
+
+
+def test_get_price_history_empty():
+    """get_price_history reports when there is no history."""
+    from makelaar_mcp.server import get_price_history
+
+    mock_listing = make_listing()
+    with patch("makelaar_mcp.server._client") as mock_client:
+        mock_client.listing.return_value = mock_listing
+        mock_client.price_history.return_value = PriceHistory(status="ok", changes=())
+        result = get_price_history(listing_id=12345678)
+
+    assert result[0]["entry_count"] == 0
 
 
 def test_get_price_history_error_handling():
@@ -234,7 +319,7 @@ def test_get_price_history_error_handling():
     from makelaar_mcp.server import get_price_history
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.side_effect = RuntimeError("timeout")
+        mock_client.listing.side_effect = RuntimeError("timeout")
         result = get_price_history(listing_id=12345678)
 
     assert isinstance(result, list)
@@ -258,7 +343,7 @@ def test_compare_listings_returns_comparison():
     )
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.side_effect = [listing_a, listing_b]
+        mock_client.listing.side_effect = [listing_a, listing_b]
         result = compare_listings(listing_ids=["11111111", "22222222"])
 
     assert isinstance(result, list)
@@ -279,6 +364,8 @@ def test_compare_listings_returns_comparison():
             "url",
         ):
             assert key in row, f"Missing comparison key: {key}"
+    assert result[0]["tiny_id"] == "11111111"
+    assert result[1]["price"] == 500_000
 
 
 def test_compare_listings_error_handling():
@@ -286,7 +373,7 @@ def test_compare_listings_error_handling():
     from makelaar_mcp.server import compare_listings
 
     with patch("makelaar_mcp.server._client") as mock_client:
-        mock_client.get_listing.side_effect = RuntimeError("API down")
+        mock_client.listing.side_effect = RuntimeError("API down")
         result = compare_listings(listing_ids=["11111111", "22222222"])
 
     assert isinstance(result, list)
@@ -632,3 +719,67 @@ def test_total_cost_error_handling():
 
     result = calculate_total_cost(purchase_price="not a number")  # type: ignore
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# error classification
+# ---------------------------------------------------------------------------
+
+
+def test_classify_error_types():
+    """_classify_error maps exceptions to coarse, model-actionable types."""
+    from makelaar_mcp import server
+    from funda import ListingNotFound, SearchError
+
+    assert server._classify_error(ListingNotFound("gone")) == "not_found"
+    assert server._classify_error(ValueError("bad")) == "bad_input"
+    assert server._classify_error(SearchError("upstream")) == "upstream"
+    assert (
+        server._classify_error(RuntimeError("curl: (92) HTTP/2 stream 1 reset"))
+        == "blocked"
+    )
+    assert (
+        server._classify_error(SearchError("Search failed (status 403)")) == "blocked"
+    )
+
+
+# ---------------------------------------------------------------------------
+# real-payload fixtures (network-free integration of the pyfunda 3.x parsers)
+# ---------------------------------------------------------------------------
+
+
+def test_detail_fixture_maps_through_helper():
+    """A recorded funda.io detail payload parses and maps to the detail dict."""
+    from funda.parsing import parse_listing
+    from makelaar_mcp.server import _detail_dict
+
+    raw = json.loads((_FIXTURES / "detail_43117443.json").read_text())
+    listing = parse_listing(raw)
+    result = _detail_dict(listing)
+
+    assert result["id"] == "43117443"
+    assert result["title"] == "Reehorst 13"
+    assert result["price"] == 695_000
+    assert result["living_area"] == 212
+    assert result["year_built"] == 1993
+    assert result["energy_label"] == "B"
+    assert result["price_per_m2"] == 695_000 // 212
+    assert len(result["photo_urls"]) > 0
+    assert result["photo_urls"][0].startswith("https://")
+
+
+def test_websearch_fixture_maps_through_helper():
+    """A recorded funda.nl web-search payload parses and maps to trimmed rows."""
+    from funda.parsing import parse_web_search_results
+    from makelaar_mcp.server import _trim_listing
+
+    raw = json.loads((_FIXTURES / "websearch_almere_listings.json").read_text())
+    listings = parse_web_search_results(raw, "buy")
+    assert listings
+    row = _trim_listing(listings[0])
+
+    assert row["id"]
+    assert isinstance(row["price"], int) and row["price"] > 0
+    assert row["living_area"] > 0
+    assert row["price_per_m2"] == row["price"] // row["living_area"]
+    assert row["url"].startswith("https://www.funda.nl/")

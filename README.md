@@ -15,9 +15,24 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Claude Code
 
+Run from a local checkout of this fork (the PyPI release predates the Funda
+search fix below):
+
 ```bash
-claude mcp add makelaar -- uvx makelaar-mcp
+git clone https://github.com/jensvanbellen/makelaar-mcp.git
+cd makelaar-mcp && uv sync
+claude mcp add makelaar --scope user -- uv run --directory "$(pwd)" makelaar-mcp
 ```
+
+Or, once published, `claude mcp add makelaar -- uvx makelaar-mcp`.
+
+> **Funda search note:** Funda's mobile search API now requires an auth token
+> (`401 no token provided`), so search falls back to the funda.nl web page.
+> Funda fronts that page with Akamai bot protection; this fork forces a
+> browser-impersonation profile that currently passes and rotates through a pool
+> on failure. `get_listing`, `get_price_history` and `compare_listings` use the
+> detail API, which still works without a token. Anti-bot measures change — if
+> search starts failing, the impersonation pool in `server.py` may need refreshing.
 
 ### Claude Desktop
 
